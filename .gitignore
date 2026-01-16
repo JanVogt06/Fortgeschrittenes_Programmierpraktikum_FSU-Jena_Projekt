@@ -5,3 +5,5 @@ out
 # Datenbank und Logs nicht pushen
 users.db
 server.log
+
+room_files
