@@ -4,6 +4,8 @@ import javax.swing.*;
 import javax.swing.border.TitledBorder;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.*;
@@ -677,6 +679,7 @@ public class ClientGUI extends JFrame {
 
     /**
      * Zeigt die Dateiliste in einem Dialog an.
+     * Doppelklick auf eine Datei lädt sie herunter und öffnet sie direkt.
      */
     private void showFileListDialog(String fileData) {
         if (fileData.isEmpty()) {
@@ -702,7 +705,21 @@ public class ClientGUI extends JFrame {
         JList<String> fileList = new JList<>(listModel);
         fileList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
 
-        // Download-Button
+        // Doppelklick zum direkten Öffnen
+        fileList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    String selected = fileList.getSelectedValue();
+                    if (selected != null) {
+                        dialog.dispose();
+                        downloadAndOpenFile(selected);
+                    }
+                }
+            }
+        });
+
+        // Download-Button (nur herunterladen, nicht öffnen)
         JButton downloadBtn = new JButton("Herunterladen");
         downloadBtn.addActionListener(e -> {
             String selected = fileList.getSelectedValue();
@@ -712,17 +729,32 @@ public class ClientGUI extends JFrame {
             }
         });
 
+        // Öffnen-Button (herunterladen und direkt öffnen)
+        JButton openBtn = new JButton("Öffnen");
+        openBtn.addActionListener(e -> {
+            String selected = fileList.getSelectedValue();
+            if (selected != null) {
+                dialog.dispose();
+                downloadAndOpenFile(selected);
+            }
+        });
+
         // Schließen-Button
         JButton closeBtn = new JButton("Schließen");
         closeBtn.addActionListener(e -> dialog.dispose());
 
         // Layout
         JPanel buttonPanel = new JPanel(new FlowLayout());
+        buttonPanel.add(openBtn);
         buttonPanel.add(downloadBtn);
         buttonPanel.add(closeBtn);
 
+        // Hinweistext
+        JLabel hintLabel = new JLabel("  " + listModel.size() + " Datei(en) - Doppelklick zum Öffnen");
+        hintLabel.setFont(hintLabel.getFont().deriveFont(Font.ITALIC));
+
         dialog.setLayout(new BorderLayout(5, 5));
-        dialog.add(new JLabel("  " + listModel.size() + " Datei(en):"), BorderLayout.NORTH);
+        dialog.add(hintLabel, BorderLayout.NORTH);
         dialog.add(new JScrollPane(fileList), BorderLayout.CENTER);
         dialog.add(buttonPanel, BorderLayout.SOUTH);
 
@@ -751,9 +783,10 @@ public class ClientGUI extends JFrame {
 
 
     /**
-     * Fordert eine Datei vom Server an.
+     * Fordert eine Datei vom Server an (nur herunterladen).
      */
     private void downloadFileFromServer(String fileName) {
+        pendingOpenAfterDownload = false;
         try {
             output.writeUTF("DOWNLOAD_FILE:" + fileName);
             output.flush();
@@ -762,6 +795,24 @@ public class ClientGUI extends JFrame {
             appendChat("Fehler: " + e.getMessage());
         }
     }
+
+
+    /**
+     * Fordert eine Datei vom Server an und öffnet sie nach dem Download.
+     */
+    private void downloadAndOpenFile(String fileName) {
+        pendingOpenAfterDownload = true;
+        try {
+            output.writeUTF("DOWNLOAD_FILE:" + fileName);
+            output.flush();
+            appendChat("Lade '" + fileName + "' herunter und öffne...");
+        } catch (IOException e) {
+            appendChat("Fehler: " + e.getMessage());
+        }
+    }
+
+    // Flag ob die Datei nach dem Download geöffnet werden soll
+    private volatile boolean pendingOpenAfterDownload = false;
 
 
     /**
@@ -775,7 +826,7 @@ public class ClientGUI extends JFrame {
      * Ablauf:
      * 1. readInt() liest die Dateigröße (4 Bytes)
      * 2. readFully() liest genau so viele Bytes
-     * 3. Speichern-Dialog zeigen (auf dem Swing-Thread)
+     * 3. Speichern-Dialog zeigen ODER in temp-Ordner speichern und öffnen
      * 4. Bytes in Datei schreiben
      */
     private void receiveFileDataNow(String fileName) {
@@ -787,26 +838,19 @@ public class ClientGUI extends JFrame {
             byte[] fileData = new byte[fileSize];
             input.readFully(fileData);
 
+            // Flag lokal speichern (könnte sich ändern)
+            boolean shouldOpenFile = pendingOpenAfterDownload;
+            pendingOpenAfterDownload = false;
+
             // Jetzt sind alle Daten gelesen, der Stream ist wieder "sauber"
             // Ab hier können wir auf den Swing-Thread wechseln für den Dialog
             SwingUtilities.invokeLater(() -> {
-                JFileChooser fileChooser = new JFileChooser();
-                fileChooser.setDialogTitle("Datei speichern");
-                fileChooser.setSelectedFile(new File(fileName));
-
-                int result = fileChooser.showSaveDialog(this);
-                if (result == JFileChooser.APPROVE_OPTION) {
-                    File targetFile = fileChooser.getSelectedFile();
-                    try (FileOutputStream fos = new FileOutputStream(targetFile)) {
-                        fos.write(fileData);
-                        appendChat("Gespeichert: " + targetFile.getAbsolutePath());
-                    } catch (IOException e) {
-                        JOptionPane.showMessageDialog(this,
-                                "Fehler beim Speichern: " + e.getMessage(),
-                                "Fehler", JOptionPane.ERROR_MESSAGE);
-                    }
+                if (shouldOpenFile) {
+                    // Direkt öffnen: In temp-Ordner speichern und mit Standardprogramm öffnen
+                    openFileDirectly(fileName, fileData);
                 } else {
-                    appendChat("Download abgebrochen.");
+                    // Normaler Download: Speicherdialog zeigen
+                    saveFileWithDialog(fileName, fileData);
                 }
             });
 
@@ -816,6 +860,77 @@ public class ClientGUI extends JFrame {
                         "Fehler beim Empfangen: " + e.getMessage(),
                         "Fehler", JOptionPane.ERROR_MESSAGE);
             });
+        }
+    }
+
+
+    /**
+     * Zeigt den Speichern-Dialog und speichert die Datei am gewählten Ort.
+     */
+    private void saveFileWithDialog(String fileName, byte[] fileData) {
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setDialogTitle("Datei speichern");
+        fileChooser.setSelectedFile(new File(fileName));
+
+        int result = fileChooser.showSaveDialog(this);
+        if (result == JFileChooser.APPROVE_OPTION) {
+            File targetFile = fileChooser.getSelectedFile();
+            try (FileOutputStream fos = new FileOutputStream(targetFile)) {
+                fos.write(fileData);
+                appendChat("Gespeichert: " + targetFile.getAbsolutePath());
+            } catch (IOException e) {
+                JOptionPane.showMessageDialog(this,
+                        "Fehler beim Speichern: " + e.getMessage(),
+                        "Fehler", JOptionPane.ERROR_MESSAGE);
+            }
+        } else {
+            appendChat("Download abgebrochen.");
+        }
+    }
+
+
+    /**
+     * Speichert die Datei im temp-Ordner und öffnet sie mit dem Standardprogramm.
+     * Wird bei Doppelklick oder "Öffnen"-Button verwendet.
+     */
+    private void openFileDirectly(String fileName, byte[] fileData) {
+        try {
+            // Im temp-Ordner speichern
+            File tempDir = new File(System.getProperty("java.io.tmpdir"), "chat_files");
+            if (!tempDir.exists()) {
+                tempDir.mkdirs();
+            }
+
+            File tempFile = new File(tempDir, fileName);
+            try (FileOutputStream fos = new FileOutputStream(tempFile)) {
+                fos.write(fileData);
+            }
+
+            appendChat("Datei heruntergeladen: " + fileName);
+
+            // Mit Standardprogramm öffnen
+            if (Desktop.isDesktopSupported()) {
+                Desktop desktop = Desktop.getDesktop();
+                if (desktop.isSupported(Desktop.Action.OPEN)) {
+                    desktop.open(tempFile);
+                    appendChat("Datei wird geöffnet...");
+                } else {
+                    JOptionPane.showMessageDialog(this,
+                            "Datei kann nicht automatisch geöffnet werden.\n" +
+                                    "Gespeichert unter: " + tempFile.getAbsolutePath(),
+                            "Hinweis", JOptionPane.INFORMATION_MESSAGE);
+                }
+            } else {
+                JOptionPane.showMessageDialog(this,
+                        "Desktop nicht unterstützt.\n" +
+                                "Datei gespeichert unter: " + tempFile.getAbsolutePath(),
+                        "Hinweis", JOptionPane.INFORMATION_MESSAGE);
+            }
+
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(this,
+                    "Fehler beim Öffnen: " + e.getMessage(),
+                    "Fehler", JOptionPane.ERROR_MESSAGE);
         }
     }
 
